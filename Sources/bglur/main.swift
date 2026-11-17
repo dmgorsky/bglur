@@ -141,12 +141,14 @@ enum BlurTransitionMath {
         return 1.0 - pow(1.0 - p, 3.0)
     }
 
-    /// Computes primary (outgoing) and secondary (incoming) overlay visibilities.
+    /// Computes primary (outgoing), secondary (incoming), and unblur (newly active window) visibilities.
     /// Primary remains at 1.0 until secondary has ramped past p = 0.35 (~72.5% blur),
-    /// ensuring deeper background windows never flash unblurred during focus switches.
-    static func overlayVisibilities(progress: Double) -> (primary: Double, secondary: Double) {
+    /// ensuring deeper background windows never flash unblurred during focus switches,
+    /// while unblur clears the newly focused window in sync (1.0 -> 0.0).
+    static func overlayVisibilities(progress: Double) -> (primary: Double, secondary: Double, unblur: Double) {
         let p = min(max(progress, 0.0), 1.0)
         let secondary = easeOutCubic(p)
+        let unblur = max(0.0, 1.0 - secondary)
         let primary: Double
         if p <= 0.35 {
             primary = 1.0
@@ -154,7 +156,7 @@ enum BlurTransitionMath {
             let q = (p - 0.35) / 0.65
             primary = max(0.0, 1.0 - easeOutCubic(q))
         }
-        return (primary, secondary)
+        return (primary, secondary, unblur)
     }
 
     static func fadeOutVisibility(from startVisibility: Double, progress: Double) -> Double {
@@ -168,7 +170,7 @@ enum BlurTransitionMath {
     }
 }
 
-// MARK: - Pure Blur View & Overlay Window
+// MARK: - Pure Blur View & Screen Overlay Window
 
 final class PureBlurView: NSVisualEffectView {
     var blurRadius: CGFloat = 24.0 {
@@ -187,20 +189,34 @@ final class PureBlurView: NSVisualEffectView {
         }
     }
 
+    var cornerRadius: CGFloat = 0.0 {
+        didSet {
+            if cornerRadius != oldValue {
+                applyVisualState()
+            }
+        }
+    }
+
+    private(set) var currentVisibility: CGFloat = 0.0
     private let tintLayer = CALayer()
+    private let maskShapeLayer = CAShapeLayer()
     private static let suppressedLayerNames: Set<String> = ["fill", "tone", "Chameleon"]
+
+    var currentMaskPath: CGPath? {
+        maskShapeLayer.path
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        commonInit()
+        commonInit(initialRect: NSRect(origin: .zero, size: frameRect.size))
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        commonInit()
+        commonInit(initialRect: bounds)
     }
 
-    private func commonInit() {
+    private func commonInit(initialRect: NSRect) {
         blendingMode = .behindWindow
         material = .fullScreenUI
         state = .active
@@ -210,6 +226,9 @@ final class PureBlurView: NSVisualEffectView {
         tintLayer.name = "bglur.tint"
         tintLayer.zPosition = 1000
         tintLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+
+        maskShapeLayer.frame = initialRect
+        maskShapeLayer.path = CGPath(rect: initialRect, transform: nil)
     }
 
     override func layout() {
@@ -232,12 +251,42 @@ final class PureBlurView: NSVisualEffectView {
         applyVisualState()
     }
 
+    func setMaskPath(_ path: CGPath?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let root = layer {
+            maskShapeLayer.frame = root.bounds
+            if root.mask !== maskShapeLayer {
+                root.mask = maskShapeLayer
+            }
+        }
+        maskShapeLayer.path = path
+        CATransaction.commit()
+    }
+
+    func apply(blurRadius: CGFloat, dimAlpha: CGFloat, visibility: CGFloat) {
+        let clamped = min(max(visibility, 0.0), 1.0)
+        currentVisibility = clamped
+        self.blurRadius = blurRadius * clamped
+        self.dimAlpha = dimAlpha * clamped
+        alphaValue = clamped > 0.001 ? min(1.0, clamped / 0.25) : 0.0
+    }
+
     func applyVisualState() {
         guard let root = layer else { return }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
+
+        root.cornerRadius = cornerRadius
+        root.cornerCurve = .continuous
+        root.masksToBounds = cornerRadius > 0
+
+        maskShapeLayer.frame = root.bounds
+        if root.mask !== maskShapeLayer {
+            root.mask = maskShapeLayer
+        }
 
         if tintLayer.superlayer !== root {
             root.addSublayer(tintLayer)
@@ -249,20 +298,13 @@ final class PureBlurView: NSVisualEffectView {
         for sublayer in root.sublayers ?? [] where sublayer !== tintLayer {
             configureBackdropHierarchy(in: sublayer)
         }
-
-        if let win = window, win.windowNumber > 0 {
-            CGSSetWindowBackgroundBlurRadius(
-                CGSMainConnectionID(),
-                UInt32(win.windowNumber),
-                Int32(blurRadius.rounded())
-            )
-        }
     }
 
     private func configureBackdropHierarchy(in layer: CALayer) {
         if layer.name == "backdrop" {
             layer.isHidden = false
             layer.opacity = 1.0
+            layer.setValue(blurRadius < 8.0 ? 1.0 : 0.5, forKey: "scale")
             layer.setValue(1.0, forKeyPath: "filters.colorSaturate.inputAmount")
             layer.setValue(blurRadius, forKeyPath: "filters.gaussianBlur.inputRadius")
             return
@@ -311,13 +353,37 @@ final class PureBlurView: NSVisualEffectView {
     }
 }
 
-final class BlurOverlayWindow: NSWindow {
-    let blurView: PureBlurView
-    private(set) var currentVisibility: CGFloat = 0.0
+final class ScreenOverlayWindow: NSWindow {
+    let baseView: PureBlurView
+    let unblurView: PureBlurView
+    let blurInView: PureBlurView
+    private let containerView: NSView
+    private let emptyPath: CGPath = CGMutablePath()
+    private static let windowCornerRadius: CGFloat = 11.0
 
-    init(frame: NSRect) {
-        let contentFrame = NSRect(origin: .zero, size: frame.size)
-        self.blurView = PureBlurView(frame: contentFrame)
+    var currentBaseVisibility: CGFloat {
+        baseView.currentVisibility
+    }
+
+    init(frame: NSRect, blurRadius: CGFloat = 24.0, dimAlpha: CGFloat = 0.05) {
+        let localBounds = NSRect(origin: .zero, size: frame.size)
+        let container = NSView(frame: localBounds)
+        container.wantsLayer = true
+        container.autoresizingMask = [.width, .height]
+
+        let base = PureBlurView(frame: localBounds)
+        let blurIn = PureBlurView(frame: localBounds)
+        let unblur = PureBlurView(frame: localBounds)
+
+        container.addSubview(base)
+        container.addSubview(blurIn)
+        container.addSubview(unblur)
+
+        self.containerView = container
+        self.baseView = base
+        self.blurInView = blurIn
+        self.unblurView = unblur
+
         super.init(
             contentRect: frame,
             styleMask: .borderless,
@@ -328,23 +394,136 @@ final class BlurOverlayWindow: NSWindow {
         backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = true
-        level = .normal
+        level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         animationBehavior = .none
         isReleasedWhenClosed = false
-        contentView = blurView
+        contentView = container
+
+        // Pre-warm all 3 backdrop layers in WindowServer; unblurView stays hot at target
+        // blur radius behind an empty mask so Frame 0 of any switch starts blurred with zero lag.
+        orderFrontRegardless()
+        hideAll(blurRadius: blurRadius, dimAlpha: dimAlpha)
+        container.layoutSubtreeIfNeeded()
     }
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
         frameRect
     }
 
-    func apply(blurRadius: CGFloat, dimAlpha: CGFloat, visibility: CGFloat) {
-        let clamped = min(max(visibility, 0.0), 1.0)
-        currentVisibility = clamped
-        blurView.blurRadius = blurRadius * clamped
-        blurView.dimAlpha = dimAlpha * clamped
-        alphaValue = clamped > 0.001 ? min(1.0, clamped * 1.25) : 0.0
+    func updateFrame(_ newFrame: NSRect) {
+        if frame != newFrame {
+            setFrame(newFrame, display: true)
+            let localBounds = NSRect(origin: .zero, size: newFrame.size)
+            containerView.frame = localBounds
+            baseView.frame = localBounds
+            blurInView.frame = localBounds
+            unblurView.frame = localBounds
+        }
+    }
+
+    func showSteadyState(
+        activeRectGlobal: NSRect?,
+        blurRadius: CGFloat,
+        dimAlpha: CGFloat,
+        visibility: CGFloat
+    ) {
+        let screenPath = CGPath(rect: CGRect(origin: .zero, size: frame.size), transform: nil)
+        let basePath = localCutoutPath(for: activeRectGlobal).map { screenPath.subtracting($0) } ?? screenPath
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        baseView.setMaskPath(basePath)
+        baseView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: visibility)
+
+        // Keep unblurView hot at full target blur behind an empty mask while blur is active.
+        unblurView.setMaskPath(emptyPath)
+        unblurView.apply(
+            blurRadius: blurRadius,
+            dimAlpha: dimAlpha,
+            visibility: visibility > 0.001 ? 1.0 : 0.0
+        )
+
+        blurInView.setMaskPath(emptyPath)
+        blurInView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
+        CATransaction.commit()
+    }
+
+    func showSwitchTransition(
+        oldRectGlobal: NSRect?,
+        newRectGlobal: NSRect?,
+        blurRadius: CGFloat,
+        dimAlpha: CGFloat,
+        primaryVis: CGFloat,
+        blurInVis: CGFloat,
+        unblurVis: CGFloat
+    ) {
+        let screenPath = CGPath(rect: CGRect(origin: .zero, size: frame.size), transform: nil)
+        let oldPath = localCutoutPath(for: oldRectGlobal)
+        let newPath = localCutoutPath(for: newRectGlobal)
+
+        let basePath: CGPath
+        if let oldPath, let newPath {
+            basePath = screenPath.subtracting(oldPath.union(newPath))
+        } else if let oldPath {
+            basePath = screenPath.subtracting(oldPath)
+        } else if let newPath {
+            basePath = screenPath.subtracting(newPath)
+        } else {
+            basePath = screenPath
+        }
+
+        let blurInPath: CGPath
+        if let oldPath {
+            blurInPath = newPath.map { oldPath.subtracting($0) } ?? oldPath
+        } else {
+            blurInPath = emptyPath
+        }
+
+        let unblurPath = newPath ?? emptyPath
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        baseView.setMaskPath(basePath)
+        baseView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: primaryVis)
+
+        blurInView.setMaskPath(blurInPath)
+        blurInView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: blurInVis)
+
+        unblurView.setMaskPath(unblurPath)
+        unblurView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: unblurVis)
+        CATransaction.commit()
+    }
+
+    func hideAll(blurRadius: CGFloat, dimAlpha: CGFloat) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        baseView.setMaskPath(emptyPath)
+        baseView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
+
+        unblurView.setMaskPath(emptyPath)
+        unblurView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
+
+        blurInView.setMaskPath(emptyPath)
+        blurInView.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
+        CATransaction.commit()
+    }
+
+    private func localCutoutPath(for globalRect: NSRect?) -> CGPath? {
+        guard let globalRect else { return nil }
+        let localRect = NSRect(
+            x: globalRect.origin.x - frame.origin.x,
+            y: globalRect.origin.y - frame.origin.y,
+            width: globalRect.size.width,
+            height: globalRect.size.height
+        )
+        let screenLocalBounds = NSRect(origin: .zero, size: frame.size)
+        let clipped = localRect.intersection(screenLocalBounds)
+        guard !clipped.isNull, clipped.width > 0.5, clipped.height > 0.5 else {
+            return nil
+        }
+        let corner = min(Self.windowCornerRadius, min(localRect.width, localRect.height) / 2.0)
+        return CGPath(roundedRect: localRect, cornerWidth: corner, cornerHeight: corner, transform: nil)
     }
 }
 
@@ -352,6 +531,7 @@ final class BlurOverlayWindow: NSWindow {
 
 struct WindowZOrderSnapshot {
     let activeWindowID: CGWindowID?
+    let activeWindowBounds: NSRect?
     let orderedWindowNumbers: [Int]
 }
 
@@ -363,31 +543,123 @@ enum ActiveWindowDetector {
         ) as? [[String: Any]] ?? []
 
         let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        return resolveActiveWindowID(from: rawList, frontPID: frontPID, ignoringPID: ignoringPID)
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0.0
+        return resolveActiveWindowID(
+            from: rawList,
+            frontPID: frontPID,
+            ignoringPID: ignoringPID,
+            primaryScreenHeight: primaryHeight
+        )
     }
 
-    static func orderedLayer0WindowNumbers() -> [Int] {
+    static func windowAtScreenPoint(
+        _ appKitPoint: NSPoint,
+        ignoringPID: pid_t = ProcessInfo.processInfo.processIdentifier
+    ) -> (id: CGWindowID, bounds: NSRect)? {
         let rawList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly],
             kCGNullWindowID
         ) as? [[String: Any]] ?? []
-        return rawList.compactMap { info in
-            guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else {
-                return nil
+
+        let primaryFrame = NSScreen.screens.first?.frame ?? .zero
+        return resolveWindowAtScreenPoint(
+            appKitPoint,
+            from: rawList,
+            ignoringPID: ignoringPID,
+            primaryScreenSize: primaryFrame.size
+        )
+    }
+
+    static func resolveWindowAtScreenPoint(
+        _ appKitPoint: NSPoint,
+        from rawList: [[String: Any]],
+        ignoringPID: pid_t,
+        primaryScreenSize: CGSize
+    ) -> (id: CGWindowID, bounds: NSRect)? {
+        var hasFullscreenBackdrop = false
+        var qualifyingWindowCount = 0
+        var hit: (id: CGWindowID, bounds: NSRect)?
+
+        for info in rawList {
+            let ownerName = info[kCGWindowOwnerName as String] as? String
+            let windowName = info[kCGWindowName as String] as? String
+            if ownerName == "WindowManager" && windowName == "Fullscreen Backdrop" {
+                hasFullscreenBackdrop = true
             }
-            return info[kCGWindowNumber as String] as? Int
+
+            guard let layer = info[kCGWindowLayer as String] as? Int,
+                  let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerPID != ignoringPID else {
+                continue
+            }
+
+            let alpha = (info[kCGWindowAlpha as String] as? Double) ?? 1.0
+            guard alpha > 0.05,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let cgBounds = CGRect(dictionaryRepresentation: boundsDict) else {
+                continue
+            }
+
+            let appKitBounds = convertCGWindowBoundsToAppKit(
+                cgBounds,
+                primaryScreenHeight: primaryScreenSize.height
+            )
+
+            // If a click hits the menu bar, Dock, Control Center, or a popup menu above layer 0,
+            // do not treat it as clicking a background app window.
+            if layer > 0 {
+                let isFullScreenHelper = primaryScreenSize.width > 0 &&
+                    primaryScreenSize.height > 0 &&
+                    appKitBounds.width >= primaryScreenSize.width * 0.9 &&
+                    appKitBounds.height >= primaryScreenSize.height * 0.9
+                if hit == nil && !isFullScreenHelper && appKitBounds.contains(appKitPoint) {
+                    return nil
+                }
+                continue
+            }
+
+            guard layer == 0,
+                  cgBounds.width >= 80.0,
+                  cgBounds.height >= 80.0,
+                  let windowNum = info[kCGWindowNumber as String] as? Int else {
+                continue
+            }
+
+            qualifyingWindowCount += 1
+
+            if hit == nil && appKitBounds.contains(appKitPoint) {
+                hit = (CGWindowID(windowNum), appKitBounds)
+            }
         }
+
+        if hasFullscreenBackdrop && qualifyingWindowCount <= 1 {
+            return nil
+        }
+
+        return hit
+    }
+
+    static func convertCGWindowBoundsToAppKit(_ cgRect: CGRect, primaryScreenHeight: CGFloat) -> NSRect {
+        NSRect(
+            x: cgRect.origin.x,
+            y: primaryScreenHeight - (cgRect.origin.y + cgRect.size.height),
+            width: cgRect.size.width,
+            height: cgRect.size.height
+        )
     }
 
     static func resolveActiveWindowID(
         from rawList: [[String: Any]],
         frontPID: pid_t?,
-        ignoringPID: pid_t
+        ignoringPID: pid_t,
+        primaryScreenHeight: CGFloat = NSScreen.screens.first?.frame.height ?? 0.0
     ) -> WindowZOrderSnapshot {
         var hasFullscreenBackdrop = false
         var qualifyingWindowCount = 0
         var frontAppWindowID: CGWindowID?
+        var frontAppCGBounds: CGRect?
         var topmostAnyWindowID: CGWindowID?
+        var topmostAnyCGBounds: CGRect?
         var orderedNumbers: [Int] = []
         orderedNumbers.reserveCapacity(rawList.count)
 
@@ -424,79 +696,61 @@ enum ActiveWindowDetector {
 
             if topmostAnyWindowID == nil {
                 topmostAnyWindowID = CGWindowID(windowNum)
+                topmostAnyCGBounds = bounds
             }
 
             if let frontPID, frontPID != ignoringPID, ownerPID == frontPID, frontAppWindowID == nil {
                 frontAppWindowID = CGWindowID(windowNum)
+                frontAppCGBounds = bounds
             }
         }
 
         let activeID: CGWindowID?
+        let activeBounds: NSRect?
         if hasFullscreenBackdrop && qualifyingWindowCount <= 1 {
             activeID = nil
+            activeBounds = nil
+        } else if let frontAppWindowID, let frontAppCGBounds {
+            activeID = frontAppWindowID
+            activeBounds = convertCGWindowBoundsToAppKit(frontAppCGBounds, primaryScreenHeight: primaryScreenHeight)
+        } else if let topmostAnyWindowID, let topmostAnyCGBounds {
+            activeID = topmostAnyWindowID
+            activeBounds = convertCGWindowBoundsToAppKit(topmostAnyCGBounds, primaryScreenHeight: primaryScreenHeight)
         } else {
-            activeID = frontAppWindowID ?? topmostAnyWindowID
+            activeID = nil
+            activeBounds = nil
         }
 
         return WindowZOrderSnapshot(
             activeWindowID: activeID,
+            activeWindowBounds: activeBounds,
             orderedWindowNumbers: orderedNumbers
         )
     }
 }
 
-// MARK: - Screen Overlay Pair & Blur Coordinator
-
-final class ScreenOverlayPair {
-    var primary: BlurOverlayWindow
-    var secondary: BlurOverlayWindow
-
-    init(frame: NSRect, blurRadius: CGFloat, dimAlpha: CGFloat) {
-        primary = BlurOverlayWindow(frame: frame)
-        secondary = BlurOverlayWindow(frame: frame)
-
-        // Pre-warm both overlay windows on-screen at alpha = 0 so CABackdropLayer
-        // initializes and suppresses AppKit's white fill layer before first blur.
-        primary.orderBack(nil)
-        secondary.orderBack(nil)
-        primary.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
-        secondary.apply(blurRadius: blurRadius, dimAlpha: dimAlpha, visibility: 0.0)
-        primary.blurView.layoutSubtreeIfNeeded()
-        secondary.blurView.layoutSubtreeIfNeeded()
-    }
-
-    func swap() {
-        Swift.swap(&primary, &secondary)
-    }
-
-    func updateFrame(_ frame: NSRect) {
-        if primary.frame != frame {
-            primary.setFrame(frame, display: true)
-        }
-        if secondary.frame != frame {
-            secondary.setFrame(frame, display: true)
-        }
-    }
-
-    func closeAll() {
-        primary.close()
-        secondary.close()
-    }
-}
+// MARK: - Blur Coordinator
 
 final class BlurCoordinator {
     private enum TransitionKind {
         case none
-        case switchWindow(newID: CGWindowID, primaryStartVisibility: Double)
-        case fadeOut(startPrimaryVisibility: Double, startSecondaryVisibility: Double)
-        case fadeIn(windowID: CGWindowID, startVisibility: Double)
+        case switchWindow(
+            newID: CGWindowID,
+            oldBounds: NSRect?,
+            newBounds: NSRect?,
+            primaryStartVisibility: Double
+        )
+        case fadeOut(bounds: NSRect?, startVisibility: Double)
+        case fadeIn(windowID: CGWindowID, bounds: NSRect?, startVisibility: Double)
     }
 
     private let settings: Settings
-    private var pairs: [CGDirectDisplayID: ScreenOverlayPair] = [:]
+    private var screens: [CGDirectDisplayID: ScreenOverlayWindow] = [:]
     private var currentActiveWindowID: CGWindowID?
-    private var pendingZOrderVerifyWindowID: CGWindowID?
-    private var unorderableWindowID: CGWindowID?
+    private var currentActiveWindowBounds: NSRect?
+    private var predictedWindowID: CGWindowID?
+    private var predictedBounds: NSRect?
+    private var predictedUntil: CFTimeInterval = 0
     private var activeTransition: TransitionKind = .none
     private var transitionStartTime: CFTimeInterval = 0
     private var animationTimer: Timer?
@@ -535,10 +789,10 @@ final class BlurCoordinator {
         }
         defaultObservers.removeAll()
 
-        for pair in pairs.values {
-            pair.closeAll()
+        for window in screens.values {
+            window.close()
         }
-        pairs.removeAll()
+        screens.removeAll()
     }
 
     func handleSettingsChanged() {
@@ -550,15 +804,19 @@ final class BlurCoordinator {
         let snapshot = ActiveWindowDetector.snapshot()
         if let activeID = snapshot.activeWindowID {
             if currentActiveWindowID != activeID {
-                unorderableWindowID = nil
-                pendingZOrderVerifyWindowID = nil
-                transitionToActiveWindow(activeID)
-            } else if unorderableWindowID == activeID {
-                return
+                predictedWindowID = nil
+                predictedBounds = nil
+                predictedUntil = 0
+                transitionToActiveWindow(activeID, newBounds: snapshot.activeWindowBounds)
             } else if case .none = activeTransition {
-                let currentVis = pairs.values.first?.primary.currentVisibility ?? 0.0
+                currentActiveWindowBounds = snapshot.activeWindowBounds
+                let currentVis = screens.values.first?.currentBaseVisibility ?? 0.0
                 if currentVis < 0.999 {
-                    beginFadeIn(to: activeID, startVisibility: Double(currentVis))
+                    beginFadeIn(
+                        to: activeID,
+                        bounds: snapshot.activeWindowBounds,
+                        startVisibility: Double(currentVis)
+                    )
                 } else {
                     applySteadyStateSettings()
                 }
@@ -568,8 +826,7 @@ final class BlurCoordinator {
             }
         } else {
             currentActiveWindowID = nil
-            unorderableWindowID = nil
-            pendingZOrderVerifyWindowID = nil
+            currentActiveWindowBounds = nil
             beginFadeOutIfNeeded()
         }
     }
@@ -599,17 +856,39 @@ final class BlurCoordinator {
         }
         defaultObservers.append(screenObs)
 
-        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] _ in
+        mouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
             DispatchQueue.main.async {
-                self?.evaluateActiveWindow()
+                if event.type == .leftMouseDown {
+                    self?.handleMouseDown(event)
+                } else {
+                    self?.evaluateActiveWindow()
+                }
             }
         }
 
-        let poll = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        let poll = Timer(timeInterval: 0.016, repeats: true) { [weak self] _ in
             self?.evaluateActiveWindow()
         }
         RunLoop.main.add(poll, forMode: .common)
         pollTimer = poll
+    }
+
+    private func handleMouseDown(_ event: NSEvent) {
+        guard settings.isEnabled else { return }
+        guard !event.modifierFlags.contains(.command) else { return }
+
+        guard let hit = ActiveWindowDetector.windowAtScreenPoint(NSEvent.mouseLocation) else {
+            return
+        }
+
+        guard hit.id != currentActiveWindowID else { return }
+
+        predictedWindowID = hit.id
+        predictedBounds = hit.bounds
+        predictedUntil = CACurrentMediaTime() + 0.2
+        transitionToActiveWindow(hit.id, newBounds: hit.bounds)
     }
 
     private func syncScreens() {
@@ -620,22 +899,22 @@ final class BlurCoordinator {
                 .map { CGDirectDisplayID($0.uint32Value) } ?? CGDirectDisplayID(index + 1)
             activeDisplayIDs.insert(displayID)
 
-            if let existing = pairs[displayID] {
+            if let existing = screens[displayID] {
                 existing.updateFrame(screen.frame)
             } else {
-                let pair = ScreenOverlayPair(
+                let overlay = ScreenOverlayWindow(
                     frame: screen.frame,
                     blurRadius: CGFloat(settings.blurRadius),
                     dimAlpha: CGFloat(settings.dimAlpha)
                 )
-                pairs[displayID] = pair
+                screens[displayID] = overlay
             }
         }
 
-        let removedIDs = pairs.keys.filter { !activeDisplayIDs.contains($0) }
+        let removedIDs = screens.keys.filter { !activeDisplayIDs.contains($0) }
         for id in removedIDs {
-            pairs[id]?.closeAll()
-            pairs.removeValue(forKey: id)
+            screens[id]?.close()
+            screens.removeValue(forKey: id)
         }
     }
 
@@ -646,154 +925,73 @@ final class BlurCoordinator {
         }
 
         let snapshot = ActiveWindowDetector.snapshot()
+
+        if let predictedID = predictedWindowID {
+            if snapshot.activeWindowID == predictedID {
+                predictedWindowID = nil
+                predictedBounds = nil
+                predictedUntil = 0
+            } else if CACurrentMediaTime() < predictedUntil {
+                return
+            } else {
+                predictedWindowID = nil
+                predictedBounds = nil
+                predictedUntil = 0
+            }
+        }
+
         guard let activeID = snapshot.activeWindowID else {
             currentActiveWindowID = nil
-            unorderableWindowID = nil
-            pendingZOrderVerifyWindowID = nil
+            currentActiveWindowBounds = nil
             beginFadeOutIfNeeded()
             return
         }
 
         if activeID != currentActiveWindowID {
-            unorderableWindowID = nil
-            pendingZOrderVerifyWindowID = nil
-            transitionToActiveWindow(activeID)
+            transitionToActiveWindow(activeID, newBounds: snapshot.activeWindowBounds)
             return
         }
 
-        // Steady-state check: keep primary right below active window if WindowServer reordered windows.
+        // In steady state, update cutout mask immediately if the active window moved or resized.
         if case .none = activeTransition {
-            if unorderableWindowID == activeID {
-                return
-            }
-            ensureSteadyZOrder(activeWindowID: activeID, snapshot: snapshot)
-        }
-    }
-
-    private func ensureSteadyZOrder(activeWindowID: CGWindowID, snapshot: WindowZOrderSnapshot) {
-        let activeInt = Int(activeWindowID)
-        guard let activeIdx = snapshot.orderedWindowNumbers.firstIndex(of: activeInt) else { return }
-
-        let ownOverlayNumbers = Set(pairs.values.flatMap { [$0.primary.windowNumber, $0.secondary.windowNumber] })
-        var hasOutOfOrderAbove = false
-        var needsReorder = false
-
-        for pair in pairs.values {
-            let overlayNum = pair.primary.windowNumber
-            if let overlayIdx = snapshot.orderedWindowNumbers.firstIndex(of: overlayNum) {
-                let outOfOrderAbove = overlayIdx < activeIdx
-                let intruderBetween = !outOfOrderAbove && snapshot.orderedWindowNumbers[(activeIdx + 1)..<overlayIdx]
-                    .contains { !ownOverlayNumbers.contains($0) }
-                if outOfOrderAbove {
-                    hasOutOfOrderAbove = true
-                    needsReorder = true
-                } else if intruderBetween {
-                    needsReorder = true
-                }
-            } else {
-                needsReorder = true
-            }
-        }
-
-        if hasOutOfOrderAbove && pendingZOrderVerifyWindowID == activeWindowID {
-            // A previous RunLoop cycle already sent order(.below), and WindowServer left it above activeID.
-            unorderableWindowID = activeWindowID
-            pendingZOrderVerifyWindowID = nil
-            finishTransitionToZero()
-            return
-        }
-
-        if needsReorder {
-            for pair in pairs.values {
-                pair.primary.order(.below, relativeTo: activeInt)
-            }
-            pendingZOrderVerifyWindowID = activeWindowID
-        } else {
-            pendingZOrderVerifyWindowID = nil
-            if let minVisibility = pairs.values.map({ Double($0.primary.currentVisibility) }).min(),
-               minVisibility < 0.999 {
-                beginFadeIn(to: activeWindowID, startVisibility: minVisibility)
+            if snapshot.activeWindowBounds != currentActiveWindowBounds {
+                currentActiveWindowBounds = snapshot.activeWindowBounds
+                applySteadyStateSettings()
             }
         }
     }
 
-    @discardableResult
-    private func hideIfOrderedAboveActiveWindow(
-        activeWindowID: CGWindowID,
-        orderedWindowNumbers: [Int]? = nil
-    ) -> Bool {
-        let numbers = orderedWindowNumbers ?? ActiveWindowDetector.orderedLayer0WindowNumbers()
-        let activeInt = Int(activeWindowID)
-        guard let activeIdx = numbers.firstIndex(of: activeInt) else { return false }
-
-        let radius = CGFloat(settings.blurRadius)
-        let dim = CGFloat(settings.dimAlpha)
-        var hidAny = false
-
-        for pair in pairs.values {
-            for overlay in [pair.primary, pair.secondary] where overlay.currentVisibility > 0.001 {
-                if let overlayIdx = numbers.firstIndex(of: overlay.windowNumber), overlayIdx < activeIdx {
-                    overlay.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
-                    hidAny = true
-                }
-            }
-        }
-
-        return hidAny
-    }
-
-    private func transitionToActiveWindow(_ newID: CGWindowID) {
+    private func transitionToActiveWindow(_ newID: CGWindowID, newBounds: NSRect?) {
         let previousID = currentActiveWindowID
+        let oldBounds = currentActiveWindowBounds
         currentActiveWindowID = newID
+        currentActiveWindowBounds = newBounds
 
-        // First active window or resuming from hidden state -> fade in primary smoothly.
-        let maxCurrentVisibility = pairs.values.map {
-            max(Double($0.primary.currentVisibility), Double($0.secondary.currentVisibility))
-        }.max() ?? 0.0
-
-        if previousID == nil || maxCurrentVisibility <= 0.01 {
-            beginFadeIn(to: newID, startVisibility: maxCurrentVisibility)
+        let currentVis = screens.values.map { Double($0.currentBaseVisibility) }.max() ?? 0.0
+        if previousID == nil || currentVis <= 0.01 {
+            beginFadeIn(to: newID, bounds: newBounds, startVisibility: currentVis)
             return
         }
 
-        // If switching rapidly mid-transition where secondary already holds more blur than primary,
-        // promote secondary to primary so existing background blur stays continuous without flashing.
-        for pair in pairs.values {
-            if pair.secondary.currentVisibility > pair.primary.currentVisibility {
-                pair.swap()
-            }
-            pair.secondary.apply(
-                blurRadius: CGFloat(settings.blurRadius),
-                dimAlpha: CGFloat(settings.dimAlpha),
-                visibility: 0.0
-            )
-            pair.secondary.order(.below, relativeTo: Int(newID))
-        }
-
-        let primaryStart = pairs.values.map { Double($0.primary.currentVisibility) }.max() ?? 1.0
-        activeTransition = .switchWindow(newID: newID, primaryStartVisibility: primaryStart)
+        activeTransition = .switchWindow(
+            newID: newID,
+            oldBounds: oldBounds,
+            newBounds: newBounds,
+            primaryStartVisibility: currentVis
+        )
         startAnimationLoop()
     }
 
-    private func beginFadeIn(to windowID: CGWindowID, startVisibility: Double) {
-        for pair in pairs.values {
-            pair.secondary.apply(
-                blurRadius: CGFloat(settings.blurRadius),
-                dimAlpha: CGFloat(settings.dimAlpha),
-                visibility: 0.0
-            )
-            pair.primary.order(.below, relativeTo: Int(windowID))
-        }
-        activeTransition = .fadeIn(windowID: windowID, startVisibility: startVisibility)
+    private func beginFadeIn(to windowID: CGWindowID, bounds: NSRect?, startVisibility: Double) {
+        currentActiveWindowID = windowID
+        currentActiveWindowBounds = bounds
+        activeTransition = .fadeIn(windowID: windowID, bounds: bounds, startVisibility: startVisibility)
         startAnimationLoop()
     }
 
     private func beginFadeOutIfNeeded() {
-        let maxCurrent = pairs.values.map {
-            max(Double($0.primary.currentVisibility), Double($0.secondary.currentVisibility))
-        }.max() ?? 0.0
-
-        guard maxCurrent > 0.001 else {
+        let currentVis = screens.values.map { Double($0.currentBaseVisibility) }.max() ?? 0.0
+        guard currentVis > 0.001 else {
             if case .none = activeTransition { return }
             finishTransitionToZero()
             return
@@ -803,11 +1001,9 @@ final class BlurCoordinator {
             return
         }
 
-        let startPrimary = pairs.values.map { Double($0.primary.currentVisibility) }.max() ?? 0.0
-        let startSecondary = pairs.values.map { Double($0.secondary.currentVisibility) }.max() ?? 0.0
         activeTransition = .fadeOut(
-            startPrimaryVisibility: startPrimary,
-            startSecondaryVisibility: startSecondary
+            bounds: currentActiveWindowBounds,
+            startVisibility: currentVis
         )
         startAnimationLoop()
     }
@@ -815,9 +1011,13 @@ final class BlurCoordinator {
     private func applySteadyStateSettings() {
         let radius = CGFloat(settings.blurRadius)
         let dim = CGFloat(settings.dimAlpha)
-        for pair in pairs.values {
-            pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: 1.0)
-            pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
+        for window in screens.values {
+            window.showSteadyState(
+                activeRectGlobal: currentActiveWindowBounds,
+                blurRadius: radius,
+                dimAlpha: dim,
+                visibility: 1.0
+            )
         }
     }
 
@@ -845,66 +1045,61 @@ final class BlurCoordinator {
             animationTimer?.invalidate()
             animationTimer = nil
 
-        case let .switchWindow(newID, primaryStartVisibility):
-            if elapsed >= 0.016 && hideIfOrderedAboveActiveWindow(activeWindowID: newID) {
-                unorderableWindowID = newID
-                finishTransitionToZero()
-                return
-            }
-
-            let (primaryFactor, secondaryFactor) = BlurTransitionMath.overlayVisibilities(progress: progress)
-            let primaryVis = CGFloat(primaryStartVisibility * primaryFactor)
-            let secondaryVis = CGFloat(secondaryFactor)
-
-            for pair in pairs.values {
-                // Re-assert z-order on every tick so late app window elevation never strands the overlay.
-                pair.secondary.order(.below, relativeTo: Int(newID))
-                pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: primaryVis)
-                pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: secondaryVis)
-            }
+        case let .switchWindow(_, oldBounds, newBounds, primaryStartVisibility):
+            let (_, secondaryFactor, unblurFactor) = BlurTransitionMath.overlayVisibilities(progress: progress)
+            let primaryVis = CGFloat(BlurTransitionMath.fadeInVisibility(from: primaryStartVisibility, progress: progress))
+            let blurInVis = CGFloat(secondaryFactor)
+            let unblurVis = CGFloat(primaryStartVisibility * unblurFactor)
 
             if progress >= 1.0 {
                 animationTimer?.invalidate()
                 animationTimer = nil
                 activeTransition = .none
-                for pair in pairs.values {
-                    pair.swap()
-                    pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
-                    pair.primary.order(.below, relativeTo: Int(newID))
-                    pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: 1.0)
-                }
-                pendingZOrderVerifyWindowID = newID
-            }
-
-        case let .fadeIn(windowID, startVisibility):
-            if elapsed >= 0.016 && hideIfOrderedAboveActiveWindow(activeWindowID: windowID) {
-                unorderableWindowID = windowID
-                finishTransitionToZero()
+                applySteadyStateSettings()
                 return
             }
 
+            for window in screens.values {
+                window.showSwitchTransition(
+                    oldRectGlobal: oldBounds,
+                    newRectGlobal: newBounds,
+                    blurRadius: radius,
+                    dimAlpha: dim,
+                    primaryVis: primaryVis,
+                    blurInVis: blurInVis,
+                    unblurVis: unblurVis
+                )
+            }
+
+        case let .fadeIn(_, bounds, startVisibility):
             let vis = CGFloat(BlurTransitionMath.fadeInVisibility(from: startVisibility, progress: progress))
-            for pair in pairs.values {
-                pair.primary.order(.below, relativeTo: Int(windowID))
-                pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: vis)
-                pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
+            for window in screens.values {
+                window.showSteadyState(
+                    activeRectGlobal: bounds,
+                    blurRadius: radius,
+                    dimAlpha: dim,
+                    visibility: vis
+                )
             }
             if progress >= 1.0 {
                 animationTimer?.invalidate()
                 animationTimer = nil
                 activeTransition = .none
-                pendingZOrderVerifyWindowID = windowID
             }
 
-        case let .fadeOut(startPrimary, startSecondary):
-            let pVis = CGFloat(BlurTransitionMath.fadeOutVisibility(from: startPrimary, progress: progress))
-            let sVis = CGFloat(BlurTransitionMath.fadeOutVisibility(from: startSecondary, progress: progress))
-            for pair in pairs.values {
-                pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: pVis)
-                pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: sVis)
-            }
+        case let .fadeOut(bounds, startVisibility):
+            let vis = CGFloat(BlurTransitionMath.fadeOutVisibility(from: startVisibility, progress: progress))
             if progress >= 1.0 {
                 finishTransitionToZero()
+                return
+            }
+            for window in screens.values {
+                window.showSteadyState(
+                    activeRectGlobal: bounds,
+                    blurRadius: radius,
+                    dimAlpha: dim,
+                    visibility: vis
+                )
             }
         }
     }
@@ -915,9 +1110,8 @@ final class BlurCoordinator {
         activeTransition = .none
         let radius = CGFloat(settings.blurRadius)
         let dim = CGFloat(settings.dimAlpha)
-        for pair in pairs.values {
-            pair.primary.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
-            pair.secondary.apply(blurRadius: radius, dimAlpha: dim, visibility: 0.0)
+        for window in screens.values {
+            window.hideAll(blurRadius: radius, dimAlpha: dim)
         }
     }
 }
@@ -1169,24 +1363,39 @@ enum SelfTest {
         check(abs(BlurTransitionMath.easeOutCubic(1.0) - 1.0) < 1e-9, "easeOutCubic(1) must be 1")
 
         let start = BlurTransitionMath.overlayVisibilities(progress: 0.0)
-        check(start.primary == 1.0 && start.secondary == 0.0, "At t=0 primary=1.0 and secondary=0.0")
+        check(
+            start.primary == 1.0 && start.secondary == 0.0 && start.unblur == 1.0,
+            "At t=0 primary=1.0, secondary=0.0, unblur=1.0"
+        )
 
         let midOverlap = BlurTransitionMath.overlayVisibilities(progress: 0.35)
         check(midOverlap.primary == 1.0 && midOverlap.secondary > 0.72, "At t=0.35 primary remains 1.0 while secondary > 0.72")
+        check(abs(midOverlap.unblur + midOverlap.secondary - 1.0) < 1e-9, "At t=0.35 unblur + secondary must equal 1.0")
+
+        for sampleT in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            let sample = BlurTransitionMath.overlayVisibilities(progress: sampleT)
+            check(abs(sample.unblur + sample.secondary - 1.0) < 1e-9, "At t=\(sampleT) unblur + secondary must equal 1.0")
+        }
 
         let end = BlurTransitionMath.overlayVisibilities(progress: 1.0)
-        check(abs(end.primary - 0.0) < 1e-9 && abs(end.secondary - 1.0) < 1e-9, "At t=1 primary=0.0 and secondary=1.0")
+        check(
+            abs(end.primary - 0.0) < 1e-9 && abs(end.secondary - 1.0) < 1e-9 && abs(end.unblur - 0.0) < 1e-9,
+            "At t=1 primary=0.0, secondary=1.0, unblur=0.0"
+        )
 
-        // 2. Verify PureBlurView strips fill/tone/Chameleon and customizes gaussianBlur.inputRadius
-        let overlay = BlurOverlayWindow(frame: NSRect(x: 0, y: 0, width: 160, height: 160))
-        overlay.orderBack(nil)
+        // 2. Verify ScreenOverlayWindow (level 1, 3 pre-warmed masked PureBlurViews, bidirectional switch masks)
+        let overlay = ScreenOverlayWindow(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+            blurRadius: 36.0,
+            dimAlpha: 0.12
+        )
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
 
-        overlay.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 1.0)
-        overlay.blurView.layoutSubtreeIfNeeded()
+        overlay.baseView.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 1.0)
+        overlay.baseView.layoutSubtreeIfNeeded()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
 
-        guard let backdrop = overlay.blurView.findBackdropLayer() else {
+        guard let backdrop = overlay.baseView.findBackdropLayer() else {
             fputs("SELF-TEST FAILED: CABackdropLayer 'backdrop' not found in PureBlurView\n", stderr)
             exit(1)
         }
@@ -1196,25 +1405,90 @@ enum SelfTest {
         check(appliedRadius == 36.0, "Expected backdrop gaussianBlur.inputRadius == 36.0, got \(String(describing: appliedRadius))")
         check(appliedSaturate == 1.0, "Expected backdrop colorSaturate.inputAmount == 1.0, got \(String(describing: appliedSaturate))")
 
-        let suppressed = overlay.blurView.findSuppressedLayers()
+        let suppressed = overlay.baseView.findSuppressedLayers()
         check(!suppressed.isEmpty, "Expected suppressed fill/tone/Chameleon layers to be present")
         for layer in suppressed {
             check(layer.isHidden && layer.opacity == 0.0, "Expected \(layer.name ?? "?") to be hidden with opacity 0")
         }
 
-        overlay.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 0.5)
+        overlay.baseView.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 0.5)
         let halfRadius = (backdrop.value(forKeyPath: "filters.gaussianBlur.inputRadius") as? NSNumber)?.doubleValue
         check(halfRadius == 18.0, "Expected half-visibility gaussianBlur.inputRadius == 18.0, got \(String(describing: halfRadius))")
-        check(abs(overlay.alphaValue - 0.625) < 0.001, "Expected alphaValue == 0.625 at visibility 0.5")
+        check(abs(overlay.baseView.alphaValue - 1.0) < 0.001, "Expected alphaValue == 1.0 at visibility 0.5")
 
-        overlay.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 0.0)
-        check(overlay.alphaValue == 0.0, "Expected alphaValue == 0.0 at visibility 0.0")
+        overlay.baseView.apply(blurRadius: 36.0, dimAlpha: 0.12, visibility: 0.125)
+        let lowRadius = (backdrop.value(forKeyPath: "filters.gaussianBlur.inputRadius") as? NSNumber)?.doubleValue
+        let lowScale = (backdrop.value(forKey: "scale") as? NSNumber)?.doubleValue
+        check(lowRadius == 4.5, "Expected low-visibility gaussianBlur.inputRadius == 4.5, got \(String(describing: lowRadius))")
+        check(lowScale == 1.0, "Expected backdrop scale == 1.0 for blurRadius < 8.0, got \(String(describing: lowScale))")
+        check(abs(overlay.baseView.alphaValue - 0.5) < 0.001, "Expected alphaValue == 0.5 at visibility 0.125")
+
+        let rectA = NSRect(x: 20, y: 40, width: 140, height: 180)
+        let rectB = NSRect(x: 200, y: 40, width: 160, height: 180)
+        let centerA = CGPoint(x: rectA.midX, y: rectA.midY)
+        let centerB = CGPoint(x: rectB.midX, y: rectB.midY)
+
+        // Steady state on Window A: baseView excludes A, includes B; unblurView stays hot at 1.0 behind empty mask
+        overlay.showSteadyState(activeRectGlobal: rectA, blurRadius: 24.0, dimAlpha: 0.05, visibility: 1.0)
+        check(overlay.baseView.currentVisibility == 1.0, "Steady state baseView must be at visibility 1.0")
+        check(overlay.unblurView.currentVisibility == 1.0, "Steady state unblurView must remain pre-warmed at 1.0")
+        check(overlay.blurInView.currentVisibility == 0.0, "Steady state blurInView must be at 0.0")
+        check(overlay.baseView.currentMaskPath?.contains(centerA) == false, "baseView mask must exclude active Window A")
+        check(overlay.baseView.currentMaskPath?.contains(centerB) == true, "baseView mask must include inactive Window B")
+        check(overlay.unblurView.currentMaskPath?.isEmpty == true, "Steady state unblurView mask must be empty")
+
+        // Switch start (p = 0.0): newly active Window B starts at unblurView visibility 1.0
+        overlay.showSwitchTransition(
+            oldRectGlobal: rectA,
+            newRectGlobal: rectB,
+            blurRadius: 24.0,
+            dimAlpha: 0.05,
+            primaryVis: 1.0,
+            blurInVis: 0.0,
+            unblurVis: 1.0
+        )
+        check(overlay.unblurView.currentVisibility == 1.0, "Switch p=0 unblurView must start at visibility 1.0")
+        check(overlay.unblurView.currentMaskPath?.contains(centerB) == true, "Switch p=0 unblurView mask must cover Window B")
+        check(overlay.unblurView.currentMaskPath?.contains(centerA) == false, "Switch p=0 unblurView mask must not cover Window A")
+        check(overlay.blurInView.currentMaskPath?.contains(centerA) == true, "Switch p=0 blurInView mask must cover Window A")
+        check(overlay.baseView.currentMaskPath?.contains(centerA) == false && overlay.baseView.currentMaskPath?.contains(centerB) == false, "baseView mask must exclude both A and B during switch")
+
+        // Mid-switch (p = 0.5)
+        overlay.showSwitchTransition(
+            oldRectGlobal: rectA,
+            newRectGlobal: rectB,
+            blurRadius: 24.0,
+            dimAlpha: 0.05,
+            primaryVis: 1.0,
+            blurInVis: 0.5,
+            unblurVis: 0.5
+        )
+        check(overlay.unblurView.currentVisibility == 0.5, "Mid-switch unblurView visibility must be 0.5")
+        check(overlay.blurInView.currentVisibility == 0.5, "Mid-switch blurInView visibility must be 0.5")
+
+        // Completion (p = 1.0 -> steady state on Window B)
+        overlay.showSteadyState(activeRectGlobal: rectB, blurRadius: 24.0, dimAlpha: 0.05, visibility: 1.0)
+        check(overlay.baseView.currentMaskPath?.contains(centerA) == true, "Completed steady state baseView must blur Window A")
+        check(overlay.baseView.currentMaskPath?.contains(centerB) == false, "Completed steady state baseView must exclude Window B")
+        check(overlay.unblurView.currentVisibility == 1.0 && overlay.unblurView.currentMaskPath?.isEmpty == true, "Completed unblurView must re-warm at 1.0 behind empty mask")
+
+        overlay.hideAll(blurRadius: 24.0, dimAlpha: 0.05)
+        check(overlay.baseView.alphaValue == 0.0 && overlay.unblurView.alphaValue == 0.0, "hideAll must zero view alphas")
+        check(overlay.level == NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue + 1), "ScreenOverlayWindow must sit at normal + 1")
         check(!overlay.collectionBehavior.contains(.fullScreenAuxiliary), "Overlay must not use .fullScreenAuxiliary")
         let fullScreenRect = NSRect(x: 0, y: 0, width: 3360, height: 1890)
         check(overlay.constrainFrameRect(fullScreenRect, to: NSScreen.main) == fullScreenRect, "Overlay constrainFrameRect must not clip frame below menu bar")
         overlay.close()
 
-        // 3. Verify ActiveWindowDetector fullscreen & space-switch resolution rules
+        // 3. Verify ActiveWindowDetector coordinate conversion and fullscreen/space-switch resolution rules
+        let converted = ActiveWindowDetector.convertCGWindowBoundsToAppKit(
+            CGRect(x: 100, y: 30, width: 800, height: 600),
+            primaryScreenHeight: 1000
+        )
+        check(
+            converted == NSRect(x: 100, y: 370, width: 800, height: 600),
+            "Expected Quartz->AppKit conversion (100, 370, 800, 600), got \(converted)"
+        )
         let makeWindow: (Int, Int, pid_t, String?, String?, Double, CGRect) -> [String: Any] = {
             num, layer, pid, owner, name, alpha, rect in
             var dict: [String: Any] = [
@@ -1262,6 +1536,28 @@ enum SelfTest {
             ignoringPID: 999
         )
         check(frontAppResolved.activeWindowID == 202, "Frontmost app window (202) should be preferred when present on Space")
+
+        let hitSample: [[String: Any]] = [
+            makeWindow(300, 1, 999, "bglur", "", 1.0, CGRect(x: 0, y: 0, width: 1440, height: 900)), // own level-1 overlay
+            makeWindow(301, 24, 1, "Window Server", "Menubar", 1.0, CGRect(x: 0, y: 0, width: 1440, height: 30)),
+            makeWindow(302, 0, 600, "Xcode", "Project", 1.0, CGRect(x: 100, y: 100, width: 600, height: 400)),
+            makeWindow(303, 0, 700, "Safari", "Docs", 1.0, CGRect(x: 500, y: 100, width: 600, height: 400))
+        ]
+        let menuClick = ActiveWindowDetector.resolveWindowAtScreenPoint(
+            NSPoint(x: 200, y: 885), // inside top 30px menubar in AppKit (900 - 30 = 870..900)
+            from: hitSample,
+            ignoringPID: 999,
+            primaryScreenSize: CGSize(width: 1440, height: 900)
+        )
+        check(menuClick == nil, "Click on menubar must not hit-test a layer-0 window")
+
+        let bgWindowClick = ActiveWindowDetector.resolveWindowAtScreenPoint(
+            NSPoint(x: 900, y: 600), // inside Safari (500..1100, yQuartz 100..500 -> yAppKit 400..800)
+            from: hitSample,
+            ignoringPID: 999,
+            primaryScreenSize: CGSize(width: 1440, height: 900)
+        )
+        check(bgWindowClick?.id == 303, "Click on background Safari window must hit window 303")
 
         // 4. Verify CGWindowListCopyWindowInfo live query runs cleanly
         let snapshot = ActiveWindowDetector.snapshot()
