@@ -359,13 +359,25 @@ final class ScreenOverlayWindow: NSWindow {
     let blurInView: PureBlurView
     private let containerView: NSView
     private let emptyPath: CGPath = CGMutablePath()
+    private var isPendingSpaceLock = false
     private static let windowCornerRadius: CGFloat = 11.0
 
     var currentBaseVisibility: CGFloat {
         baseView.currentVisibility
     }
 
-    init(frame: NSRect, blurRadius: CGFloat = 24.0, dimAlpha: CGFloat = 0.05) {
+    var isFullyHidden: Bool {
+        baseView.currentVisibility <= 0.001 &&
+        unblurView.currentVisibility <= 0.001 &&
+        blurInView.currentVisibility <= 0.001
+    }
+
+    init(
+        frame: NSRect,
+        blurRadius: CGFloat = 24.0,
+        dimAlpha: CGFloat = 0.05,
+        orderImmediately: Bool = true
+    ) {
         let localBounds = NSRect(origin: .zero, size: frame.size)
         let container = NSView(frame: localBounds)
         container.wantsLayer = true
@@ -395,16 +407,30 @@ final class ScreenOverlayWindow: NSWindow {
         hasShadow = false
         ignoresMouseEvents = true
         level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue + 1)
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        // Space-bound by default so switching to a native Fullscreen Space slides this
+        // overlay away with the Desktop Space instead of floating over and blinking the fullscreen app.
+        collectionBehavior = [.ignoresCycle]
         animationBehavior = .none
         isReleasedWhenClosed = false
         contentView = container
 
-        // Pre-warm all 3 backdrop layers in WindowServer; unblurView stays hot at target
-        // blur radius behind an empty mask so Frame 0 of any switch starts blurred with zero lag.
-        orderFrontRegardless()
         hideAll(blurRadius: blurRadius, dimAlpha: dimAlpha)
         container.layoutSubtreeIfNeeded()
+        if orderImmediately {
+            orderFrontRegardless()
+        }
+    }
+
+    func moveToActiveSpace() {
+        collectionBehavior = [.moveToActiveSpace, .ignoresCycle]
+        orderFrontRegardless()
+        guard !isPendingSpaceLock else { return }
+        isPendingSpaceLock = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isPendingSpaceLock = false
+            self.collectionBehavior = [.ignoresCycle]
+        }
     }
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
@@ -532,6 +558,7 @@ final class ScreenOverlayWindow: NSWindow {
 struct WindowZOrderSnapshot {
     let activeWindowID: CGWindowID?
     let activeWindowBounds: NSRect?
+    let isFullscreenSpace: Bool
     let orderedWindowNumbers: [Int]
 }
 
@@ -570,6 +597,20 @@ enum ActiveWindowDetector {
         )
     }
 
+    static func isFullscreenBackdropWindow(_ info: [String: Any]) -> Bool {
+        guard (info[kCGWindowOwnerName as String] as? String) == "WindowManager" else {
+            return false
+        }
+        if (info[kCGWindowName as String] as? String) == "Fullscreen Backdrop" {
+            return true
+        }
+        // Without Screen Recording TCC permission macOS redacts kCGWindowName to nil,
+        // so identify WindowManager's Fullscreen Backdrop by its layer (> desktopWindow, < 0).
+        let layer = (info[kCGWindowLayer as String] as? Int) ?? 0
+        let desktopLevel = Int(CGWindowLevelForKey(.desktopWindow))
+        return layer > desktopLevel && layer < 0
+    }
+
     static func resolveWindowAtScreenPoint(
         _ appKitPoint: NSPoint,
         from rawList: [[String: Any]],
@@ -581,9 +622,7 @@ enum ActiveWindowDetector {
         var hit: (id: CGWindowID, bounds: NSRect)?
 
         for info in rawList {
-            let ownerName = info[kCGWindowOwnerName as String] as? String
-            let windowName = info[kCGWindowName as String] as? String
-            if ownerName == "WindowManager" && windowName == "Fullscreen Backdrop" {
+            if isFullscreenBackdropWindow(info) {
                 hasFullscreenBackdrop = true
             }
 
@@ -648,26 +687,44 @@ enum ActiveWindowDetector {
         )
     }
 
+    static func isFullScreenBounds(
+        _ bounds: NSRect?,
+        screens: [(frame: NSRect, visibleFrame: NSRect)] = NSScreen.screens.map { ($0.frame, $0.visibleFrame) }
+    ) -> Bool {
+        guard let bounds else { return false }
+        for screen in screens {
+            let intersection = bounds.intersection(screen.frame)
+            guard !intersection.isNull else { continue }
+            let coversWidth = intersection.width >= screen.frame.width - 2.0
+            let coversHeight = intersection.height >= screen.visibleFrame.height - 2.0
+            if coversWidth && coversHeight {
+                return true
+            }
+        }
+        return false
+    }
+
     static func resolveActiveWindowID(
         from rawList: [[String: Any]],
         frontPID: pid_t?,
         ignoringPID: pid_t,
         primaryScreenHeight: CGFloat = NSScreen.screens.first?.frame.height ?? 0.0
     ) -> WindowZOrderSnapshot {
-        var hasFullscreenBackdrop = false
+        var fullscreenBackdropRects: [CGRect] = []
         var qualifyingWindowCount = 0
         var frontAppWindowID: CGWindowID?
         var frontAppCGBounds: CGRect?
+        var frontAppAllCGBounds: [CGRect] = []
         var topmostAnyWindowID: CGWindowID?
         var topmostAnyCGBounds: CGRect?
         var orderedNumbers: [Int] = []
         orderedNumbers.reserveCapacity(rawList.count)
 
         for info in rawList {
-            let ownerName = info[kCGWindowOwnerName as String] as? String
-            let windowName = info[kCGWindowName as String] as? String
-            if ownerName == "WindowManager" && windowName == "Fullscreen Backdrop" {
-                hasFullscreenBackdrop = true
+            if isFullscreenBackdropWindow(info),
+               let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+               let backdropBounds = CGRect(dictionaryRepresentation: boundsDict) {
+                fullscreenBackdropRects.append(backdropBounds)
             }
 
             guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
@@ -699,15 +756,29 @@ enum ActiveWindowDetector {
                 topmostAnyCGBounds = bounds
             }
 
-            if let frontPID, frontPID != ignoringPID, ownerPID == frontPID, frontAppWindowID == nil {
-                frontAppWindowID = CGWindowID(windowNum)
-                frontAppCGBounds = bounds
+            if let frontPID, frontPID != ignoringPID, ownerPID == frontPID {
+                frontAppAllCGBounds.append(bounds)
+                if frontAppWindowID == nil {
+                    frontAppWindowID = CGWindowID(windowNum)
+                    frontAppCGBounds = bounds
+                }
             }
         }
 
+        let hasFullscreenBackdrop = !fullscreenBackdropRects.isEmpty
+        let frontMatchesFullscreenBackdrop = frontAppAllCGBounds.contains { frontBounds in
+            fullscreenBackdropRects.contains { backdrop in
+                abs(backdrop.origin.x - frontBounds.origin.x) <= 20.0 &&
+                frontBounds.width >= backdrop.width - 20.0 &&
+                frontBounds.height >= backdrop.height - 60.0
+            }
+        }
+
+        let isFullscreenSpace = hasFullscreenBackdrop && (qualifyingWindowCount <= 1 || frontMatchesFullscreenBackdrop)
+
         let activeID: CGWindowID?
         let activeBounds: NSRect?
-        if hasFullscreenBackdrop && qualifyingWindowCount <= 1 {
+        if isFullscreenSpace {
             activeID = nil
             activeBounds = nil
         } else if let frontAppWindowID, let frontAppCGBounds {
@@ -724,6 +795,7 @@ enum ActiveWindowDetector {
         return WindowZOrderSnapshot(
             activeWindowID: activeID,
             activeWindowBounds: activeBounds,
+            isFullscreenSpace: isFullscreenSpace,
             orderedWindowNumbers: orderedNumbers
         )
     }
@@ -825,9 +897,13 @@ final class BlurCoordinator {
                 tickTransition()
             }
         } else {
-            currentActiveWindowID = nil
-            currentActiveWindowBounds = nil
-            beginFadeOutIfNeeded()
+            if snapshot.isFullscreenSpace {
+                handleFullscreenSpace()
+            } else {
+                currentActiveWindowID = nil
+                currentActiveWindowBounds = nil
+                beginFadeOutIfNeeded()
+            }
         }
     }
 
@@ -893,6 +969,7 @@ final class BlurCoordinator {
 
     private func syncScreens() {
         var activeDisplayIDs = Set<CGDirectDisplayID>()
+        let isFullscreen = ActiveWindowDetector.snapshot().isFullscreenSpace
 
         for (index, screen) in NSScreen.screens.enumerated() {
             let displayID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
@@ -905,7 +982,8 @@ final class BlurCoordinator {
                 let overlay = ScreenOverlayWindow(
                     frame: screen.frame,
                     blurRadius: CGFloat(settings.blurRadius),
-                    dimAlpha: CGFloat(settings.dimAlpha)
+                    dimAlpha: CGFloat(settings.dimAlpha),
+                    orderImmediately: !isFullscreen
                 )
                 screens[displayID] = overlay
             }
@@ -918,6 +996,15 @@ final class BlurCoordinator {
         }
     }
 
+    private func handleFullscreenSpace() {
+        predictedWindowID = nil
+        predictedBounds = nil
+        predictedUntil = 0
+        animationTimer?.invalidate()
+        animationTimer = nil
+        activeTransition = .none
+    }
+
     private func evaluateActiveWindow() {
         guard settings.isEnabled else {
             beginFadeOutIfNeeded()
@@ -925,6 +1012,27 @@ final class BlurCoordinator {
         }
 
         let snapshot = ActiveWindowDetector.snapshot()
+
+        if snapshot.isFullscreenSpace {
+            handleFullscreenSpace()
+            return
+        }
+
+        // Bring Space-bound overlays onto the current Desktop Space if needed.
+        let radius = CGFloat(settings.blurRadius)
+        let dim = CGFloat(settings.dimAlpha)
+        var movedToNewSpace = false
+        for window in screens.values where !window.isVisible || !window.isOnActiveSpace {
+            if !window.isFullyHidden {
+                window.hideAll(blurRadius: radius, dimAlpha: dim)
+            }
+            window.moveToActiveSpace()
+            movedToNewSpace = true
+        }
+        if movedToNewSpace {
+            currentActiveWindowID = nil
+            currentActiveWindowBounds = nil
+        }
 
         if let predictedID = predictedWindowID {
             if snapshot.activeWindowID == predictedID {
@@ -966,6 +1074,15 @@ final class BlurCoordinator {
         let oldBounds = currentActiveWindowBounds
         currentActiveWindowID = newID
         currentActiveWindowBounds = newBounds
+
+        if ActiveWindowDetector.isFullScreenBounds(newBounds) {
+            // Go straight to unblurred when switching to a full-screen window.
+            animationTimer?.invalidate()
+            animationTimer = nil
+            activeTransition = .none
+            applySteadyStateSettings()
+            return
+        }
 
         let currentVis = screens.values.map { Double($0.currentBaseVisibility) }.max() ?? 0.0
         if previousID == nil || currentVis <= 0.01 {
@@ -1473,9 +1590,14 @@ enum SelfTest {
         check(overlay.unblurView.currentVisibility == 1.0 && overlay.unblurView.currentMaskPath?.isEmpty == true, "Completed unblurView must re-warm at 1.0 behind empty mask")
 
         overlay.hideAll(blurRadius: 24.0, dimAlpha: 0.05)
+        check(overlay.isFullyHidden, "hideAll must mark overlay as isFullyHidden")
         check(overlay.baseView.alphaValue == 0.0 && overlay.unblurView.alphaValue == 0.0, "hideAll must zero view alphas")
         check(overlay.level == NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue + 1), "ScreenOverlayWindow must sit at normal + 1")
         check(!overlay.collectionBehavior.contains(.fullScreenAuxiliary), "Overlay must not use .fullScreenAuxiliary")
+        check(!overlay.collectionBehavior.contains(.canJoinAllSpaces), "Overlay must be Space-bound, not .canJoinAllSpaces")
+        overlay.moveToActiveSpace()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+        check(!overlay.collectionBehavior.contains(.moveToActiveSpace) && overlay.collectionBehavior.contains(.ignoresCycle), "moveToActiveSpace must lock behavior back to [.ignoresCycle] after RunLoop commit")
         let fullScreenRect = NSRect(x: 0, y: 0, width: 3360, height: 1890)
         check(overlay.constrainFrameRect(fullScreenRect, to: NSScreen.main) == fullScreenRect, "Overlay constrainFrameRect must not clip frame below menu bar")
         overlay.close()
@@ -1517,7 +1639,61 @@ enum SelfTest {
             frontPID: 500,
             ignoringPID: 999
         )
-        check(fullscreenResolved.activeWindowID == nil, "Single-window Fullscreen Space must resolve activeWindowID to nil")
+        check(
+            fullscreenResolved.activeWindowID == nil && fullscreenResolved.isFullscreenSpace,
+            "Single-window Fullscreen Space must resolve activeWindowID to nil with isFullscreenSpace=true"
+        )
+
+        let midSwipeFullscreenSample: [[String: Any]] = [
+            makeWindow(100, 0, 600, "Slack", "Chat", 1.0, CGRect(x: -900, y: 100, width: 1000, height: 700)),
+            makeWindow(101, 0, 500, "Zed", "Workspace", 1.0, CGRect(x: 540, y: 30, width: 1440, height: 870)),
+            makeWindow(102, -2147483622, 10, "WindowManager", "Fullscreen Backdrop", 1.0, CGRect(x: 540, y: 0, width: 1440, height: 900))
+        ]
+        let midSwipeFullscreenResolved = ActiveWindowDetector.resolveActiveWindowID(
+            from: midSwipeFullscreenSample,
+            frontPID: 500,
+            ignoringPID: 999
+        )
+        check(
+            midSwipeFullscreenResolved.activeWindowID == nil && midSwipeFullscreenResolved.isFullscreenSpace,
+            "Switching to native Fullscreen Space mid-swipe must resolve isFullscreenSpace=true and activeWindowID=nil"
+        )
+
+        // Verify Fullscreen Backdrop detection still works when kCGWindowName is nil (without Screen Recording TCC)
+        let redactedNameFullscreenSample: [[String: Any]] = [
+            makeWindow(100, 0, 600, "Slack", nil, 1.0, CGRect(x: -900, y: 100, width: 1000, height: 700)),
+            makeWindow(101, 0, 500, "Zed", nil, 1.0, CGRect(x: 540, y: 30, width: 1440, height: 870)),
+            makeWindow(102, -2147483622, 10, "WindowManager", nil, 1.0, CGRect(x: 540, y: 0, width: 1440, height: 900)),
+            makeWindow(103, -2147483624, 10, "WindowManager", nil, 1.0, CGRect(x: 0, y: 0, width: 1440, height: 900))
+        ]
+        let redactedResolved = ActiveWindowDetector.resolveActiveWindowID(
+            from: redactedNameFullscreenSample,
+            frontPID: 500,
+            ignoringPID: 999
+        )
+        check(
+            redactedResolved.activeWindowID == nil && redactedResolved.isFullscreenSpace,
+            "Redacted-name Fullscreen Space must resolve isFullscreenSpace=true by WindowManager layer"
+        )
+
+        let desktopWallpaperOnlySample: [[String: Any]] = [
+            makeWindow(201, 0, 600, "Xcode", nil, 1.0, CGRect(x: 100, y: 100, width: 1200, height: 800)),
+            makeWindow(202, -2147483624, 10, "WindowManager", nil, 1.0, CGRect(x: 0, y: 0, width: 1440, height: 900))
+        ]
+        let desktopWallpaperResolved = ActiveWindowDetector.resolveActiveWindowID(
+            from: desktopWallpaperOnlySample,
+            frontPID: 600,
+            ignoringPID: 999
+        )
+        check(
+            desktopWallpaperResolved.activeWindowID == 201 && !desktopWallpaperResolved.isFullscreenSpace,
+            "Wallpaper-only WindowManager layer (-2147483624) must not be treated as Fullscreen Space"
+        )
+
+        let fakeScreens = [(frame: NSRect(x: 0, y: 0, width: 1440, height: 900), visibleFrame: NSRect(x: 0, y: 0, width: 1440, height: 870))]
+        check(ActiveWindowDetector.isFullScreenBounds(NSRect(x: 0, y: 0, width: 1440, height: 870), screens: fakeScreens), "Full-screen bounds must match")
+        check(!ActiveWindowDetector.isFullScreenBounds(NSRect(x: 0, y: 0, width: 720, height: 870), screens: fakeScreens), "Half-screen bounds must not match full-screen")
+        check(!ActiveWindowDetector.isFullScreenBounds(NSRect(x: 100, y: 100, width: 900, height: 600), screens: fakeScreens), "Floating window bounds must not match full-screen")
 
         let spaceSwitchSample: [[String: Any]] = [
             makeWindow(201, 0, 600, "Xcode", "Project", 1.0, CGRect(x: 100, y: 100, width: 1200, height: 800)),
